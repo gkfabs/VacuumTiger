@@ -20,6 +20,44 @@ const LDS_COVER_REPORT: u8 = 0x25;
 const WATER_BOX_REPORT: u8 = 0x26;
 const MCU_VERSION_REPORT: u8 = 0x01;
 
+const UNKNOWN_SAFETY_STATE: u16 = u16::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SafetySnapshot {
+    pub bumper: u16,
+    pub drop: u16,
+    pub cliff: u16,
+    pub dock: u16,
+}
+
+#[derive(Clone)]
+pub(crate) struct SafetySensors {
+    bumper: Arc<AtomicU16>,
+    drop: Arc<AtomicU16>,
+    cliff: Arc<AtomicU16>,
+    dock: Arc<AtomicU16>,
+}
+
+impl SafetySensors {
+    fn new() -> Self {
+        Self {
+            bumper: Arc::new(AtomicU16::new(UNKNOWN_SAFETY_STATE)),
+            drop: Arc::new(AtomicU16::new(UNKNOWN_SAFETY_STATE)),
+            cliff: Arc::new(AtomicU16::new(UNKNOWN_SAFETY_STATE)),
+            dock: Arc::new(AtomicU16::new(UNKNOWN_SAFETY_STATE)),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> SafetySnapshot {
+        SafetySnapshot {
+            bumper: self.bumper.load(Ordering::Acquire),
+            drop: self.drop.load(Ordering::Acquire),
+            cliff: self.cliff.load(Ordering::Acquire),
+            dock: self.dock.load(Ordering::Acquire),
+        }
+    }
+}
+
 fn group(name: &str) -> Arc<Mutex<SensorGroupData>> {
     Arc::new(Mutex::new(SensorGroupData::new(name)))
 }
@@ -60,7 +98,7 @@ pub(crate) struct SensorGroups {
     pub dock_ir: Arc<Mutex<SensorGroupData>>,
     pub device_version: Arc<Mutex<SensorGroupData>>,
     pub lidar: Arc<Mutex<SensorGroupData>>,
-    dock_state: Arc<AtomicU16>,
+    safety_sensors: SafetySensors,
     stream_tx: StreamSender,
     wheel_metres_per_tick: f32,
 }
@@ -79,7 +117,7 @@ impl SensorGroups {
         let dock_ir = group("dock_ir");
         let device_version = group("device_version");
         let lidar = group("lidar");
-        let dock_state = Arc::new(AtomicU16::new(u16::MAX));
+        let safety_sensors = SafetySensors::new();
         let (stream_tx, stream_rx) = create_stream_channel();
 
         update_group(&device_version, |data| {
@@ -133,7 +171,7 @@ impl SensorGroups {
                 dock_ir,
                 device_version,
                 lidar,
-                dock_state,
+                safety_sensors,
                 stream_tx,
                 wheel_metres_per_tick: wheel_mm_per_tick / 1000.0,
             },
@@ -224,10 +262,33 @@ impl SensorGroups {
     }
 
     pub(crate) fn dock_state(&self) -> Arc<AtomicU16> {
-        Arc::clone(&self.dock_state)
+        Arc::clone(&self.safety_sensors.dock)
+    }
+
+    pub(crate) fn safety_sensors(&self) -> SafetySensors {
+        self.safety_sensors.clone()
     }
 
     fn process_discrete_sensors(&self, frame: &Frame) {
+        if let Some(value) = frame
+            .report(BUMPER_REPORT)
+            .and_then(|report| little_u16(report.data))
+        {
+            self.safety_sensors.bumper.store(value, Ordering::Release);
+        }
+        if let Some(value) = frame
+            .report(DROP_REPORT)
+            .and_then(|report| little_u16(report.data))
+        {
+            self.safety_sensors.drop.store(value, Ordering::Release);
+        }
+        if let Some(value) = frame
+            .report(CLIFF_REPORT)
+            .and_then(|report| little_u16(report.data))
+        {
+            self.safety_sensors.cliff.store(value, Ordering::Release);
+        }
+
         let reports = [
             (KEY_REPORT, "buttons_raw"),
             (BUMPER_REPORT, "bumper_raw"),
@@ -325,7 +386,7 @@ impl SensorGroups {
             return;
         }
         if let Some(value) = dock {
-            self.dock_state.store(value, Ordering::Release);
+            self.safety_sensors.dock.store(value, Ordering::Release);
         }
         update_group(&self.power_status, |data| {
             if let Some(battery) = battery {

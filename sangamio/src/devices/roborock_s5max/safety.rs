@@ -83,6 +83,10 @@ impl SafetyController {
         Ok(())
     }
 
+    pub(crate) fn telemetry_fresh(&self, now: Instant) -> bool {
+        self.lifecycle.safety_reports_fresh(now)
+    }
+
     pub(crate) fn arm_drive_lease(&self, linear: f32, angular: f32, now: Instant) -> Result<()> {
         let mut inner = self
             .inner

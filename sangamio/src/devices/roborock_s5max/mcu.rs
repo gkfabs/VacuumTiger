@@ -10,7 +10,7 @@ use super::commands::{
 use super::lifecycle::{Lifecycle, SAFETY_REPORT_TIMEOUT};
 use super::packet::{FrameDecoder, ReportFooter};
 use super::safety::SafetyController;
-use super::sensors::SensorGroups;
+use super::sensors::{SafetySensors, SafetySnapshot, SensorGroups};
 use super::sys::MCU_BAUD;
 use super::tty::ExclusiveTty;
 use crate::error::{Error, Result};
@@ -32,6 +32,30 @@ const ACK_LENGTH: u8 = 1;
 const ACK_DEDUP_WINDOW_FRAMES: u32 = 128;
 const COMMAND_QUEUE_CAPACITY: usize = 8;
 const COMMAND_TIMEOUT: Duration = Duration::from_millis(200);
+// Keep a forced bumper escape below approximately 0.124 m/s with the measured
+// 0.798 mm/tick wheel scale. The normal drive path keeps the higher limit.
+const MAX_FORCED_BUMPER_REVERSE_TICKS: f32 = 3.1;
+const MAX_FORCED_BUMPER_YAW: f32 = 0.8;
+
+fn force_bounded_bumper_reverse(
+    safety: SafetySnapshot,
+    telemetry_fresh: bool,
+    linear: f32,
+    angular: f32,
+) -> bool {
+    telemetry_fresh
+        && safety.bumper & 0x0101 != 0
+        && safety.drop == 0
+        && safety.cliff & 0x1111 == 0
+        && safety.dock == 0
+        && linear < 0.0
+        && linear.abs() <= MAX_FORCED_BUMPER_REVERSE_TICKS
+        && angular.abs() <= MAX_FORCED_BUMPER_YAW
+}
+
+fn forced_bumper_hazard(snapshot: SafetySnapshot) -> bool {
+    snapshot.drop != 0 || snapshot.cliff & 0x1111 != 0 || snapshot.dock != 0
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DriveStep {
@@ -259,6 +283,7 @@ impl McuDriver {
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
         let tty = ExclusiveTty::open(path, MCU_BAUD, MCU_BAUD_NUMBER)?;
+        let safety_sensors = sensors.safety_sensors();
         let (ready_tx, ready_rx) = bounded(1);
         let (command_tx, command_rx) = bounded(COMMAND_QUEUE_CAPACITY);
         let command_acks = Arc::new(CommandAckTracker::default());
@@ -275,6 +300,7 @@ impl McuDriver {
                     sensors,
                     lifecycle,
                     safety,
+                    safety_sensors,
                     &thread_shutdown,
                     SessionChannels {
                         ready: ready_tx,
@@ -345,6 +371,8 @@ struct McuSafetyGuard<'a> {
     next_sequence: Cell<u8>,
     drive_active: Cell<bool>,
     safety: SafetyController,
+    safety_sensors: SafetySensors,
+    bumper_recovery_forced: Cell<bool>,
     command_acks: Arc<CommandAckTracker>,
     armed: bool,
 }
@@ -354,6 +382,7 @@ impl<'a> McuSafetyGuard<'a> {
         tty: &'a ExclusiveTty,
         first_sequence: u8,
         safety: SafetyController,
+        safety_sensors: SafetySensors,
         command_acks: Arc<CommandAckTracker>,
     ) -> Self {
         Self {
@@ -361,6 +390,8 @@ impl<'a> McuSafetyGuard<'a> {
             next_sequence: Cell::new(first_sequence),
             drive_active: Cell::new(false),
             safety,
+            safety_sensors,
+            bumper_recovery_forced: Cell::new(false),
             command_acks,
             armed: true,
         }
@@ -393,6 +424,7 @@ impl<'a> McuSafetyGuard<'a> {
     fn forced_wheel_stop(&self) -> Result<()> {
         self.send(wheel_command_frame(self.take_sequence(), 0.0, 0.0, true))?;
         self.drive_active.set(false);
+        self.bumper_recovery_forced.set(false);
         Ok(())
     }
 
@@ -411,6 +443,18 @@ impl<'a> McuSafetyGuard<'a> {
             }
             ActuatorCommand::Drive { linear, angular } => {
                 let nonzero = linear != 0.0 || angular != 0.0;
+                let force_recovery = force_bounded_bumper_reverse(
+                    self.safety_sensors.snapshot(),
+                    self.safety.telemetry_fresh(Instant::now()),
+                    linear,
+                    angular,
+                );
+                let recovery_was_forced = self.bumper_recovery_forced.replace(force_recovery);
+                if force_recovery && !recovery_was_forced {
+                    log::warn!("S5 Max bumper held; starting bounded forced reverse recovery");
+                } else if !force_recovery && recovery_was_forced {
+                    log::info!("S5 Max forced bumper reverse recovery ended");
+                }
                 for step in drive_steps(self.drive_active.get(), linear, angular) {
                     match step {
                         // The MCU can return to idle while SangamIO retains UART
@@ -431,7 +475,7 @@ impl<'a> McuSafetyGuard<'a> {
                             self.take_sequence(),
                             linear,
                             angular,
-                            false,
+                            force_recovery,
                         ))?,
                     }
                 }
@@ -607,6 +651,7 @@ fn session_loop(
     sensors: SensorGroups,
     lifecycle: Lifecycle,
     safety: SafetyController,
+    safety_sensors: SafetySensors,
     shutdown: &AtomicBool,
     channels: SessionChannels,
 ) -> Result<()> {
@@ -615,6 +660,7 @@ fn session_loop(
         &tty,
         first_sequence,
         safety,
+        safety_sensors,
         Arc::clone(&channels.command_acks),
     );
     let session_result = guarded_session_loop(&guard, sensors, lifecycle, shutdown, channels);
@@ -758,6 +804,15 @@ fn guarded_session_loop(
             }
             if !duplicate {
                 sensors.process_mcu_frame(&frame);
+                if guard.bumper_recovery_forced.get()
+                    && forced_bumper_hazard(guard.safety_sensors.snapshot())
+                {
+                    log::warn!(
+                        "S5 Max forced bumper reverse stopped by cliff, drop, or dock state"
+                    );
+                    guard.forced_wheel_stop()?;
+                    guard.safety.clear_drive_target()?;
+                }
                 if frame.is_state_report() {
                     lifecycle.mark_safety_report(now);
                     safety_report_deadline = Some(now + SAFETY_REPORT_TIMEOUT);
@@ -796,13 +851,15 @@ fn guarded_session_loop(
 mod tests {
     use super::{
         ACK_TIMEOUT, AckRetryWindow, CommandAckTracker, DriveStep, RecentAckRequests,
-        contains_sensor_snapshot, drive_steps, notify_startup, ordered_stop_frames,
+        contains_sensor_snapshot, drive_steps, force_bounded_bumper_reverse, forced_bumper_hazard,
+        notify_startup, ordered_stop_frames,
     };
     use crate::devices::roborock_s5max::commands::{
         fan_command_frame, main_brush_command_frame, side_brush_command_frame,
         water_pump_command_frame, wheel_command_frame,
     };
     use crate::devices::roborock_s5max::packet::Frame;
+    use crate::devices::roborock_s5max::sensors::SafetySnapshot;
     use crossbeam_channel::{TryRecvError, bounded};
     use std::time::{Duration, Instant};
 
@@ -819,6 +876,67 @@ mod tests {
         assert_eq!(drive_steps(true, 1.0, 0.0), refresh);
         assert_eq!(drive_steps(true, 0.0, 0.0), refresh);
         assert_eq!(drive_steps(false, 0.0, 1.0), start);
+    }
+
+    #[test]
+    fn forces_only_a_bounded_reverse_from_bumper_contact() {
+        let clear_except_bumper = SafetySnapshot {
+            bumper: 0x0001,
+            drop: 0,
+            cliff: 0,
+            dock: 0,
+        };
+        assert!(force_bounded_bumper_reverse(
+            clear_except_bumper,
+            true,
+            -1.25,
+            0.0
+        ));
+        assert!(!force_bounded_bumper_reverse(
+            clear_except_bumper,
+            true,
+            1.25,
+            0.0
+        ));
+        assert!(!force_bounded_bumper_reverse(
+            clear_except_bumper,
+            true,
+            -3.2,
+            0.0
+        ));
+        assert!(!force_bounded_bumper_reverse(
+            clear_except_bumper,
+            false,
+            -1.25,
+            0.0
+        ));
+    }
+
+    #[test]
+    fn other_hazards_block_forced_bumper_recovery() {
+        for safety in [
+            SafetySnapshot {
+                bumper: 0x0001,
+                drop: 1,
+                cliff: 0,
+                dock: 0,
+            },
+            SafetySnapshot {
+                bumper: 0x0001,
+                drop: 0,
+                cliff: 0x0010,
+                dock: 0,
+            },
+            SafetySnapshot {
+                bumper: 0x0001,
+                drop: 0,
+                cliff: 0,
+                dock: 1,
+            },
+        ] {
+            assert!(!force_bounded_bumper_reverse(safety, true, -1.25, 0.0));
+            assert!(forced_bumper_hazard(safety));
+        }
     }
 
     #[test]
