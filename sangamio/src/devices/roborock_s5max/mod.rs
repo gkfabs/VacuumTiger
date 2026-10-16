@@ -36,6 +36,11 @@ use std::time::{Duration, Instant};
 use tty::ensure_devices_unowned;
 use watchdog::HardwareWatchdog;
 
+const UNDOCK_TIMEOUT: Duration = Duration::from_secs(3);
+const UNDOCK_DOCK_CLEAR_TIME: Duration = Duration::from_millis(300);
+const UNDOCK_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+const UNDOCK_CHARGER_TRANSITION_TIME: Duration = Duration::from_millis(500);
+
 /// Read-oriented production driver for the Roborock S5 Max.
 pub struct RoborockS5MaxDriver {
     config: DeviceConfig,
@@ -250,6 +255,86 @@ impl RoborockS5MaxDriver {
         Ok(())
     }
 
+    fn undock(&mut self) -> Result<()> {
+        let dock_state = self
+            .dock_state
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| Error::Other("S5 Max dock state is unavailable".to_string()))?;
+        let initial_dock_state = dock_state.load(Ordering::Acquire);
+        if initial_dock_state == 0 {
+            return Ok(());
+        }
+        if !matches!(initial_dock_state, 1 | 3) {
+            return Err(Error::Other(format!(
+                "S5 Max undock requires a known dock state; dock_state={initial_dock_state}"
+            )));
+        }
+
+        let allow_actuation = self
+            .config
+            .roborock_s5max
+            .as_ref()
+            .is_some_and(|hardware| hardware.allow_actuation);
+        self.safety
+            .nonzero_allowed(allow_actuation, Instant::now())?;
+        self.execute_actuator(ActuatorCommand::StopDrive, false)?;
+        self.set_charging(false)?;
+
+        // Disabling the charger can produce a short disconnected report while
+        // the contacts remain engaged. Wait for the physical-contact report to
+        // return before movement so that this transition cannot pass the
+        // stable contact-loss test below.
+        let charger_transition_deadline = Instant::now() + UNDOCK_CHARGER_TRANSITION_TIME;
+        while dock_state.load(Ordering::Acquire) == 0
+            && Instant::now() < charger_transition_deadline
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let dock_state_after_charger_disable = dock_state.load(Ordering::Acquire);
+        if !matches!(dock_state_after_charger_disable, 1 | 3) {
+            let restore_result = self.set_charging(true);
+            restore_result?;
+            return Err(Error::Other(format!(
+                "S5 Max dock contact was not confirmed after charger disable; dock_state={dock_state_after_charger_disable}"
+            )));
+        }
+
+        let deadline = Instant::now() + UNDOCK_TIMEOUT;
+        let mut dock_clear_since = None;
+        let mut undocked = false;
+        while Instant::now() < deadline {
+            self.execute_actuator(ActuatorCommand::Undock, true)?;
+            let now = Instant::now();
+            if dock_state.load(Ordering::Acquire) == 0 {
+                let clear_since = dock_clear_since.get_or_insert(now);
+                if now.duration_since(*clear_since) >= UNDOCK_DOCK_CLEAR_TIME {
+                    undocked = true;
+                    break;
+                }
+            } else {
+                dock_clear_since = None;
+            }
+            thread::sleep(UNDOCK_REFRESH_INTERVAL);
+        }
+
+        let stop_result = self.execute_actuator(ActuatorCommand::StopDrive, false);
+        if undocked {
+            stop_result?;
+            self.restore_charging_on_shutdown = false;
+            self.operational_subsystems_ready = false;
+            log::info!("S5 Max undock completed after stable dock-contact loss");
+            return Ok(());
+        }
+
+        let restore_result = self.set_charging(true);
+        stop_result?;
+        restore_result?;
+        Err(Error::Other(
+            "S5 Max undock did not reach stable dock-contact loss before timeout".to_string(),
+        ))
+    }
+
     fn prepare_operational_subsystems(&mut self) -> Result<()> {
         let dock_state = self
             .dock_state
@@ -399,6 +484,15 @@ impl RoborockS5MaxDriver {
                 ComponentAction::Disable { .. } => self.set_charging(false),
                 _ => Err(Error::InvalidParameter(
                     "S5 Max charger supports only Enable and Disable".to_string(),
+                )),
+            },
+            "undock" => match action {
+                ComponentAction::Enable { .. } => self.undock(),
+                ComponentAction::Disable { .. } => {
+                    self.execute_actuator(ActuatorCommand::StopDrive, false)
+                }
+                _ => Err(Error::InvalidParameter(
+                    "S5 Max undock supports only Enable and Disable".to_string(),
                 )),
             },
             _ => Err(Error::InvalidParameter(format!(

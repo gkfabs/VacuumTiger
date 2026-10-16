@@ -38,6 +38,11 @@ const MAX_FORCED_BUMPER_REVERSE_TICKS: f32 = 3.1;
 const MAX_FORCED_BUMPER_YAW: f32 = 0.8;
 const MAX_FORCED_CLIFF_REVERSE_TICKS: f32 = 1.6;
 const FORCED_CLIFF_REVERSE_DURATION: Duration = Duration::from_millis(800);
+// The stock undock sequence uses c0(v=-2.381818,w=0,forced=1). Keep the
+// target and its maximum duration internal so callers cannot request an
+// arbitrary forced drive while the robot is docked.
+const FORCED_UNDOCK_REVERSE_TICKS: f32 = -2.381_818;
+const FORCED_UNDOCK_DURATION: Duration = Duration::from_secs(3);
 
 fn force_bounded_bumper_reverse(
     safety: SafetySnapshot,
@@ -82,6 +87,20 @@ fn forced_cliff_hazard(snapshot: SafetySnapshot) -> bool {
         || snapshot.dock != 0
 }
 
+fn forced_undock_allowed(snapshot: SafetySnapshot, telemetry_fresh: bool) -> bool {
+    telemetry_fresh
+        && (snapshot.bumper == u16::MAX || snapshot.bumper & 0x0101 == 0)
+        && snapshot.drop == 0
+        && (snapshot.cliff == u16::MAX || snapshot.cliff & 0x1111 == 0)
+        && matches!(snapshot.dock, 1 | 3)
+}
+
+fn forced_undock_hazard(snapshot: SafetySnapshot) -> bool {
+    (snapshot.bumper != u16::MAX && snapshot.bumper & 0x0101 != 0)
+        || snapshot.drop != 0
+        || (snapshot.cliff != u16::MAX && snapshot.cliff & 0x1111 != 0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DriveStep {
     WakeMcu,
@@ -109,6 +128,7 @@ pub(crate) enum ActuatorCommand {
     WakeMcu,
     EnableSubsystem(u32),
     Drive { linear: f32, angular: f32 },
+    Undock,
     StopDrive,
     Fan(u8),
     MainBrush(u8),
@@ -401,6 +421,9 @@ struct McuSafetyGuard<'a> {
     cliff_recovery_forced: Cell<bool>,
     cliff_recovery_consumed: Cell<bool>,
     cliff_recovery_deadline: Cell<Option<Instant>>,
+    undock_forced: Cell<bool>,
+    undock_aborted: Cell<bool>,
+    undock_deadline: Cell<Option<Instant>>,
     command_acks: Arc<CommandAckTracker>,
     armed: bool,
 }
@@ -423,6 +446,9 @@ impl<'a> McuSafetyGuard<'a> {
             cliff_recovery_forced: Cell::new(false),
             cliff_recovery_consumed: Cell::new(false),
             cliff_recovery_deadline: Cell::new(None),
+            undock_forced: Cell::new(false),
+            undock_aborted: Cell::new(false),
+            undock_deadline: Cell::new(None),
             command_acks,
             armed: true,
         }
@@ -457,6 +483,8 @@ impl<'a> McuSafetyGuard<'a> {
         self.drive_active.set(false);
         self.bumper_recovery_forced.set(false);
         self.cliff_recovery_forced.set(false);
+        self.undock_forced.set(false);
+        self.undock_deadline.set(None);
         Ok(())
     }
 
@@ -547,8 +575,69 @@ impl<'a> McuSafetyGuard<'a> {
                     .arm_drive_lease(effective_linear, effective_angular, now)?;
                 self.drive_active.set(nonzero);
             }
+            ActuatorCommand::Undock => {
+                let now = Instant::now();
+                let snapshot = self.safety_sensors.snapshot();
+                let telemetry_fresh = self.safety.telemetry_fresh(now);
+                let active = self.undock_forced.get();
+                let expired = self
+                    .undock_deadline
+                    .get()
+                    .is_some_and(|deadline| now >= deadline);
+                let blocked = !telemetry_fresh
+                    || forced_undock_hazard(snapshot)
+                    || self.undock_aborted.get()
+                    || (!active && !forced_undock_allowed(snapshot, telemetry_fresh))
+                    || expired;
+                if blocked {
+                    if active {
+                        self.undock_aborted.set(true);
+                    }
+                    self.forced_wheel_stop()?;
+                    self.safety.clear_drive_target()?;
+                    log::warn!(
+                        "S5 Max forced undock reverse rejected or stopped: fresh={telemetry_fresh} bumper=0x{:04x} drop=0x{:04x} cliff=0x{:04x} dock={}",
+                        snapshot.bumper,
+                        snapshot.drop,
+                        snapshot.cliff,
+                        snapshot.dock,
+                    );
+                } else {
+                    if !active {
+                        self.undock_forced.set(true);
+                        self.undock_deadline.set(Some(now + FORCED_UNDOCK_DURATION));
+                        log::info!("S5 Max starting bounded forced undock reverse");
+                    }
+                    for step in
+                        drive_steps(self.drive_active.get(), FORCED_UNDOCK_REVERSE_TICKS, 0.0)
+                    {
+                        match step {
+                            DriveStep::WakeMcu => {
+                                self.send(system_mode_command_frame(self.take_sequence(), 0))?;
+                            }
+                            DriveStep::EnableWheels => {
+                                let sequence = self.take_sequence();
+                                acknowledgements.push(self.send_requiring_ack(
+                                    sequence,
+                                    subsystem_state_frame(sequence, WHEEL_ODOMETRY_SUBSYSTEM, true),
+                                )?);
+                            }
+                            DriveStep::Velocity => self.send(wheel_command_frame(
+                                self.take_sequence(),
+                                FORCED_UNDOCK_REVERSE_TICKS,
+                                0.0,
+                                true,
+                            ))?,
+                        }
+                    }
+                    self.safety
+                        .arm_drive_lease(FORCED_UNDOCK_REVERSE_TICKS, 0.0, now)?;
+                    self.drive_active.set(true);
+                }
+            }
             ActuatorCommand::StopDrive => {
                 self.forced_wheel_stop()?;
+                self.undock_aborted.set(false);
                 self.safety.clear_drive_target()?;
             }
             ActuatorCommand::Fan(target) => {
@@ -626,6 +715,9 @@ impl<'a> McuSafetyGuard<'a> {
             }
         }
         self.drive_active.set(false);
+        self.undock_forced.set(false);
+        self.undock_aborted.set(false);
+        self.undock_deadline.set(None);
         self.safety.reset_targets();
         if failures.is_empty() {
             Ok(())
@@ -785,7 +877,21 @@ fn guarded_session_loop(
         }
         if guard.safety.take_expired_drive_lease(now) {
             log::warn!("S5 Max drive lease expired; sending forced zero-wheel stop");
+            if guard.undock_forced.get() {
+                guard.undock_aborted.set(true);
+            }
             guard.forced_wheel_stop()?;
+        }
+        if guard.undock_forced.get()
+            && guard
+                .undock_deadline
+                .get()
+                .is_some_and(|deadline| now >= deadline)
+        {
+            log::warn!("S5 Max forced undock reverse reached its time bound");
+            guard.undock_aborted.set(true);
+            guard.forced_wheel_stop()?;
+            guard.safety.clear_drive_target()?;
         }
         if safety_report_deadline.is_some_and(|deadline| now >= deadline) {
             return Err(Error::Other(format!(
@@ -888,6 +994,14 @@ fn guarded_session_loop(
                     guard.forced_wheel_stop()?;
                     guard.safety.clear_drive_target()?;
                 }
+                if guard.undock_forced.get()
+                    && forced_undock_hazard(guard.safety_sensors.snapshot())
+                {
+                    log::warn!("S5 Max forced undock reverse stopped by a safety state");
+                    guard.undock_aborted.set(true);
+                    guard.forced_wheel_stop()?;
+                    guard.safety.clear_drive_target()?;
+                }
                 if frame.is_state_report() {
                     lifecycle.mark_safety_report(now);
                     safety_report_deadline = Some(now + SAFETY_REPORT_TIMEOUT);
@@ -927,8 +1041,8 @@ mod tests {
     use super::{
         ACK_TIMEOUT, AckRetryWindow, CommandAckTracker, DriveStep, RecentAckRequests,
         contains_sensor_snapshot, drive_steps, force_bounded_bumper_reverse,
-        force_bounded_cliff_reverse, forced_bumper_hazard, forced_cliff_hazard, notify_startup,
-        ordered_stop_frames,
+        force_bounded_cliff_reverse, forced_bumper_hazard, forced_cliff_hazard,
+        forced_undock_allowed, forced_undock_hazard, notify_startup, ordered_stop_frames,
     };
     use crate::devices::roborock_s5max::commands::{
         fan_command_frame, main_brush_command_frame, side_brush_command_frame,
@@ -1062,6 +1176,47 @@ mod tests {
             cliff: 0,
             dock: 0,
         }));
+    }
+
+    #[test]
+    fn undock_requires_a_dock_and_clear_safety_sensors() {
+        let docked = SafetySnapshot {
+            bumper: 0,
+            drop: 0,
+            cliff: 0,
+            dock: 1,
+        };
+        assert!(forced_undock_allowed(docked, true));
+        assert!(!forced_undock_allowed(docked, false));
+        assert!(!forced_undock_hazard(docked));
+        assert!(forced_undock_allowed(
+            SafetySnapshot {
+                bumper: u16::MAX,
+                cliff: u16::MAX,
+                ..docked
+            },
+            true
+        ));
+
+        for safety in [
+            SafetySnapshot {
+                bumper: 1,
+                ..docked
+            },
+            SafetySnapshot { drop: 1, ..docked },
+            SafetySnapshot {
+                cliff: 0x0010,
+                ..docked
+            },
+            SafetySnapshot { dock: 0, ..docked },
+            SafetySnapshot { dock: 2, ..docked },
+            SafetySnapshot {
+                dock: u16::MAX,
+                ..docked
+            },
+        ] {
+            assert!(!forced_undock_allowed(safety, true));
+        }
     }
 
     #[test]
