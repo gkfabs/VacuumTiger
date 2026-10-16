@@ -36,6 +36,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_millis(200);
 // 0.798 mm/tick wheel scale. The normal drive path keeps the higher limit.
 const MAX_FORCED_BUMPER_REVERSE_TICKS: f32 = 3.1;
 const MAX_FORCED_BUMPER_YAW: f32 = 0.8;
+const MAX_FORCED_CLIFF_REVERSE_TICKS: f32 = 1.6;
+const FORCED_CLIFF_REVERSE_DURATION: Duration = Duration::from_millis(800);
 
 fn force_bounded_bumper_reverse(
     safety: SafetySnapshot,
@@ -55,6 +57,29 @@ fn force_bounded_bumper_reverse(
 
 fn forced_bumper_hazard(snapshot: SafetySnapshot) -> bool {
     snapshot.drop != 0 || snapshot.cliff & 0x1111 != 0 || snapshot.dock != 0
+}
+
+fn force_bounded_cliff_reverse(
+    safety: SafetySnapshot,
+    telemetry_fresh: bool,
+    linear: f32,
+    angular: f32,
+) -> bool {
+    telemetry_fresh
+        && safety.bumper & 0x0101 == 0
+        && safety.drop == 0
+        && safety.cliff & 0x1111 != 0
+        && safety.dock == 0
+        && linear < 0.0
+        && linear.abs() <= MAX_FORCED_CLIFF_REVERSE_TICKS
+        && angular.abs() <= f32::EPSILON
+}
+
+fn forced_cliff_hazard(snapshot: SafetySnapshot) -> bool {
+    snapshot.bumper & 0x0101 != 0
+        || snapshot.drop != 0
+        || snapshot.cliff & 0x1111 == 0
+        || snapshot.dock != 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,6 +398,9 @@ struct McuSafetyGuard<'a> {
     safety: SafetyController,
     safety_sensors: SafetySensors,
     bumper_recovery_forced: Cell<bool>,
+    cliff_recovery_forced: Cell<bool>,
+    cliff_recovery_consumed: Cell<bool>,
+    cliff_recovery_deadline: Cell<Option<Instant>>,
     command_acks: Arc<CommandAckTracker>,
     armed: bool,
 }
@@ -392,6 +420,9 @@ impl<'a> McuSafetyGuard<'a> {
             safety,
             safety_sensors,
             bumper_recovery_forced: Cell::new(false),
+            cliff_recovery_forced: Cell::new(false),
+            cliff_recovery_consumed: Cell::new(false),
+            cliff_recovery_deadline: Cell::new(None),
             command_acks,
             armed: true,
         }
@@ -425,6 +456,7 @@ impl<'a> McuSafetyGuard<'a> {
         self.send(wheel_command_frame(self.take_sequence(), 0.0, 0.0, true))?;
         self.drive_active.set(false);
         self.bumper_recovery_forced.set(false);
+        self.cliff_recovery_forced.set(false);
         Ok(())
     }
 
@@ -442,20 +474,52 @@ impl<'a> McuSafetyGuard<'a> {
                 )?);
             }
             ActuatorCommand::Drive { linear, angular } => {
-                let nonzero = linear != 0.0 || angular != 0.0;
-                let force_recovery = force_bounded_bumper_reverse(
-                    self.safety_sensors.snapshot(),
-                    self.safety.telemetry_fresh(Instant::now()),
-                    linear,
-                    angular,
-                );
-                let recovery_was_forced = self.bumper_recovery_forced.replace(force_recovery);
-                if force_recovery && !recovery_was_forced {
+                let now = Instant::now();
+                let snapshot = self.safety_sensors.snapshot();
+                let telemetry_fresh = self.safety.telemetry_fresh(now);
+                if snapshot.cliff & 0x1111 == 0 {
+                    self.cliff_recovery_consumed.set(false);
+                    self.cliff_recovery_deadline.set(None);
+                }
+                let force_bumper_recovery =
+                    force_bounded_bumper_reverse(snapshot, telemetry_fresh, linear, angular);
+                let cliff_candidate =
+                    force_bounded_cliff_reverse(snapshot, telemetry_fresh, linear, angular);
+                let force_cliff_recovery = if cliff_candidate {
+                    if !self.cliff_recovery_consumed.get() {
+                        self.cliff_recovery_consumed.set(true);
+                        self.cliff_recovery_deadline
+                            .set(Some(now + FORCED_CLIFF_REVERSE_DURATION));
+                    }
+                    self.cliff_recovery_deadline
+                        .get()
+                        .is_some_and(|deadline| now < deadline)
+                } else {
+                    false
+                };
+                let bumper_was_forced = self.bumper_recovery_forced.replace(force_bumper_recovery);
+                let cliff_was_forced = self.cliff_recovery_forced.replace(force_cliff_recovery);
+                if force_bumper_recovery && !bumper_was_forced {
                     log::warn!("S5 Max bumper held; starting bounded forced reverse recovery");
-                } else if !force_recovery && recovery_was_forced {
+                } else if !force_bumper_recovery && bumper_was_forced {
                     log::info!("S5 Max forced bumper reverse recovery ended");
                 }
-                for step in drive_steps(self.drive_active.get(), linear, angular) {
+                if force_cliff_recovery && !cliff_was_forced {
+                    log::warn!("S5 Max cliff active; starting bounded forced reverse recovery");
+                } else if !force_cliff_recovery && cliff_was_forced {
+                    log::info!("S5 Max forced cliff reverse recovery ended");
+                }
+                let cliff_budget_exhausted = cliff_candidate && !force_cliff_recovery;
+                let (effective_linear, effective_angular) = if cliff_budget_exhausted {
+                    (0.0, 0.0)
+                } else {
+                    (linear, angular)
+                };
+                let force_recovery = force_bumper_recovery || force_cliff_recovery;
+                let nonzero = effective_linear != 0.0 || effective_angular != 0.0;
+                for step in
+                    drive_steps(self.drive_active.get(), effective_linear, effective_angular)
+                {
                     match step {
                         // The MCU can return to idle while SangamIO retains UART
                         // ownership. Wake it and restore the wheel prerequisite at
@@ -473,14 +537,14 @@ impl<'a> McuSafetyGuard<'a> {
                         }
                         DriveStep::Velocity => self.send(wheel_command_frame(
                             self.take_sequence(),
-                            linear,
-                            angular,
+                            effective_linear,
+                            effective_angular,
                             force_recovery,
                         ))?,
                     }
                 }
                 self.safety
-                    .arm_drive_lease(linear, angular, Instant::now())?;
+                    .arm_drive_lease(effective_linear, effective_angular, now)?;
                 self.drive_active.set(nonzero);
             }
             ActuatorCommand::StopDrive => {
@@ -813,6 +877,17 @@ fn guarded_session_loop(
                     guard.forced_wheel_stop()?;
                     guard.safety.clear_drive_target()?;
                 }
+                if guard.cliff_recovery_forced.get()
+                    && (forced_cliff_hazard(guard.safety_sensors.snapshot())
+                        || guard
+                            .cliff_recovery_deadline
+                            .get()
+                            .is_some_and(|deadline| now >= deadline))
+                {
+                    log::warn!("S5 Max forced cliff reverse stopped by its bound or safety state");
+                    guard.forced_wheel_stop()?;
+                    guard.safety.clear_drive_target()?;
+                }
                 if frame.is_state_report() {
                     lifecycle.mark_safety_report(now);
                     safety_report_deadline = Some(now + SAFETY_REPORT_TIMEOUT);
@@ -851,8 +926,9 @@ fn guarded_session_loop(
 mod tests {
     use super::{
         ACK_TIMEOUT, AckRetryWindow, CommandAckTracker, DriveStep, RecentAckRequests,
-        contains_sensor_snapshot, drive_steps, force_bounded_bumper_reverse, forced_bumper_hazard,
-        notify_startup, ordered_stop_frames,
+        contains_sensor_snapshot, drive_steps, force_bounded_bumper_reverse,
+        force_bounded_cliff_reverse, forced_bumper_hazard, forced_cliff_hazard, notify_startup,
+        ordered_stop_frames,
     };
     use crate::devices::roborock_s5max::commands::{
         fan_command_frame, main_brush_command_frame, side_brush_command_frame,
@@ -937,6 +1013,55 @@ mod tests {
             assert!(!force_bounded_bumper_reverse(safety, true, -1.25, 0.0));
             assert!(forced_bumper_hazard(safety));
         }
+    }
+
+    #[test]
+    fn forces_only_a_slow_straight_reverse_from_a_cliff() {
+        let cliff_only = SafetySnapshot {
+            bumper: 0,
+            drop: 0,
+            cliff: 0x0010,
+            dock: 0,
+        };
+        assert!(force_bounded_cliff_reverse(cliff_only, true, -1.25, 0.0));
+        assert!(!force_bounded_cliff_reverse(cliff_only, true, 1.25, 0.0));
+        assert!(!force_bounded_cliff_reverse(cliff_only, true, -1.7, 0.0));
+        assert!(!force_bounded_cliff_reverse(cliff_only, true, -1.25, 0.1));
+        assert!(!force_bounded_cliff_reverse(cliff_only, false, -1.25, 0.0));
+        assert!(!forced_cliff_hazard(cliff_only));
+    }
+
+    #[test]
+    fn other_hazards_block_forced_cliff_recovery() {
+        for safety in [
+            SafetySnapshot {
+                bumper: 0x0001,
+                drop: 0,
+                cliff: 0x0010,
+                dock: 0,
+            },
+            SafetySnapshot {
+                bumper: 0,
+                drop: 1,
+                cliff: 0x0010,
+                dock: 0,
+            },
+            SafetySnapshot {
+                bumper: 0,
+                drop: 0,
+                cliff: 0x0010,
+                dock: 1,
+            },
+        ] {
+            assert!(!force_bounded_cliff_reverse(safety, true, -1.25, 0.0));
+            assert!(forced_cliff_hazard(safety));
+        }
+        assert!(forced_cliff_hazard(SafetySnapshot {
+            bumper: 0,
+            drop: 0,
+            cliff: 0,
+            dock: 0,
+        }));
     }
 
     #[test]
