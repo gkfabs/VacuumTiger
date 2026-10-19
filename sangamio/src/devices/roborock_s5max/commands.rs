@@ -25,6 +25,7 @@ pub const MAIN_BRUSH_SUBSYSTEM: u32 = 0x00080;
 pub const SIDE_BRUSH_SUBSYSTEM: u32 = 0x00100;
 pub const FAN_SUBSYSTEM: u32 = 0x00200;
 pub const WHEEL_ODOMETRY_SUBSYSTEM: u32 = 0x00400;
+pub const DOCK_IR_SUBSYSTEM: u32 = 0x02000;
 pub const OPERATIONAL_SUBSYSTEMS: &[u32] = &[
     0x00002, // bumper
     0x00004, // compatibility hook used by the stock operational transition
@@ -36,7 +37,7 @@ pub const OPERATIONAL_SUBSYSTEMS: &[u32] = &[
     FAN_SUBSYSTEM,
     WHEEL_ODOMETRY_SUBSYSTEM,
     0x00800, // gyro
-    0x02000, // dock IR receivers
+    DOCK_IR_SUBSYSTEM,
     0x04000, // water-box sensor
     0x08000, // water pump
     0x20000, // light-touch/wall sensor

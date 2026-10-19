@@ -22,7 +22,7 @@ use crate::config::DeviceConfig;
 use crate::core::driver::{DeviceDriver, DriverInitResult};
 use crate::core::types::{Command, ComponentAction, SensorValue};
 use crate::error::{Error, Result};
-use commands::OPERATIONAL_SUBSYSTEMS;
+use commands::{DOCK_IR_SUBSYSTEM, OPERATIONAL_SUBSYSTEMS};
 use lds_motor::LdsMotorGuard;
 use lds_reader::LdsReader;
 use lifecycle::{DriverState, Lifecycle};
@@ -585,6 +585,14 @@ impl DeviceDriver for RoborockS5MaxDriver {
             }
         };
         self.mcu = Some(mcu);
+        if let Err(error) =
+            self.execute_actuator(ActuatorCommand::EnableSubsystem(DOCK_IR_SUBSYSTEM), false)
+        {
+            self.lifecycle
+                .fault(format!("dock IR receiver startup: {error}"));
+            let _ = self.shutdown_all();
+            return Err(error);
+        }
         if let Err(error) = self.lifecycle.mark_read_only_ready() {
             self.lifecycle.fault(error.to_string());
             let _ = self.shutdown_all();
