@@ -30,7 +30,7 @@ use mcu::{ActuatorCommand, McuDriver};
 use safety::SafetyController;
 use sensors::SensorGroups;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use tty::ensure_devices_unowned;
@@ -40,6 +40,9 @@ const UNDOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const UNDOCK_DOCK_CLEAR_TIME: Duration = Duration::from_millis(300);
 const UNDOCK_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const UNDOCK_CHARGER_TRANSITION_TIME: Duration = Duration::from_millis(500);
+const OPERATIONAL_REPORT_TIMEOUT: Duration = Duration::from_millis(300);
+const OPERATIONAL_REPORT_MINIMUM: u32 = 2;
+const OPERATIONAL_START_ATTEMPTS: u8 = 3;
 
 /// Read-oriented production driver for the Roborock S5 Max.
 pub struct RoborockS5MaxDriver {
@@ -52,6 +55,7 @@ pub struct RoborockS5MaxDriver {
     lifecycle: Lifecycle,
     safety: SafetyController,
     dock_state: Option<Arc<AtomicU16>>,
+    state_report_count: Option<Arc<AtomicU32>>,
     restore_charging_on_shutdown: bool,
     operational_subsystems_ready: bool,
     initialized: bool,
@@ -76,6 +80,7 @@ impl RoborockS5MaxDriver {
             lifecycle,
             safety,
             dock_state: None,
+            state_report_count: None,
             restore_charging_on_shutdown: false,
             operational_subsystems_ready: false,
             initialized: false,
@@ -138,6 +143,7 @@ impl RoborockS5MaxDriver {
             first_error.get_or_insert(error);
         }
         self.initialized = false;
+        self.state_report_count = None;
         self.operational_subsystems_ready = false;
         self.safety.reset_targets();
 
@@ -300,6 +306,12 @@ impl RoborockS5MaxDriver {
             )));
         }
 
+        // A cold takeover can leave the MCU in its docked idle state. The
+        // wheel-only prerequisite is not sufficient in that state. Reproduce
+        // the stock operational transition before the bounded forced reverse.
+        self.enable_operational_subsystems()?;
+        thread::sleep(Duration::from_millis(250));
+
         let deadline = Instant::now() + UNDOCK_TIMEOUT;
         let mut dock_clear_since = None;
         let mut undocked = false;
@@ -335,6 +347,38 @@ impl RoborockS5MaxDriver {
         ))
     }
 
+    fn enable_operational_subsystems(&self) -> Result<()> {
+        self.execute_actuator(ActuatorCommand::WakeMcu, false)?;
+        self.execute_actuator(ActuatorCommand::StopDrive, false)?;
+        for &subsystem in OPERATIONAL_SUBSYSTEMS {
+            self.execute_actuator(ActuatorCommand::EnableSubsystem(subsystem), false)?;
+        }
+        Ok(())
+    }
+
+    fn current_state_report_count(&self) -> Result<u32> {
+        self.state_report_count
+            .as_ref()
+            .map(|count| count.load(Ordering::Acquire))
+            .ok_or_else(|| Error::Other("S5 Max state report counter is unavailable".to_string()))
+    }
+
+    fn wait_for_state_reports(&self, initial_count: u32) -> bool {
+        let Some(count) = self.state_report_count.as_ref() else {
+            return false;
+        };
+        let deadline = Instant::now() + OPERATIONAL_REPORT_TIMEOUT;
+        while Instant::now() < deadline {
+            if count.load(Ordering::Acquire).wrapping_sub(initial_count)
+                >= OPERATIONAL_REPORT_MINIMUM
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
     fn prepare_operational_subsystems(&mut self) -> Result<()> {
         let dock_state = self
             .dock_state
@@ -346,7 +390,12 @@ impl RoborockS5MaxDriver {
             )));
         }
         if self.operational_subsystems_ready {
-            return Ok(());
+            let initial_count = self.current_state_report_count()?;
+            if self.wait_for_state_reports(initial_count) {
+                return Ok(());
+            }
+            log::warn!("S5 Max state reports stopped. Repeating the operational transition");
+            self.operational_subsystems_ready = false;
         }
 
         // A permanent replacement can take ownership before the stock stack
@@ -354,20 +403,30 @@ impl RoborockS5MaxDriver {
         // discharge, wake, forced-stop, and subsystem-enable sequence before
         // either wheels or the LDS motor become active.
         self.execute_actuator(ActuatorCommand::Charger(false), false)?;
-        self.execute_actuator(ActuatorCommand::WakeMcu, false)?;
-        self.execute_actuator(ActuatorCommand::StopDrive, false)?;
-        for &subsystem in OPERATIONAL_SUBSYSTEMS {
-            self.execute_actuator(ActuatorCommand::EnableSubsystem(subsystem), false)?;
+        for attempt in 1..=OPERATIONAL_START_ATTEMPTS {
+            let initial_count = self.current_state_report_count()?;
+            self.enable_operational_subsystems()?;
+            if self.wait_for_state_reports(initial_count) {
+                self.operational_subsystems_ready = true;
+                if attempt > 1 {
+                    log::info!("S5 Max operational transition recovered after attempt {attempt}");
+                }
+                return Ok(());
+            }
+            log::warn!(
+                "S5 Max operational transition attempt {attempt} produced no fresh state reports"
+            );
         }
-        thread::sleep(Duration::from_millis(250));
-        self.operational_subsystems_ready = true;
-        Ok(())
+        Err(Error::Other(format!(
+            "S5 Max operational transition produced fewer than {OPERATIONAL_REPORT_MINIMUM} state reports after {OPERATIONAL_START_ATTEMPTS} attempts"
+        )))
     }
 
     fn set_lidar(&mut self, enabled: bool) -> Result<()> {
         if !enabled {
             let stop_result = self.lds_motor.as_ref().map_or(Ok(()), LdsMotorGuard::stop);
             let safety_result = self.safety.set_lds_running(false);
+            self.operational_subsystems_ready = false;
             return stop_result.and(safety_result);
         }
 
@@ -396,6 +455,13 @@ impl RoborockS5MaxDriver {
         if let Err(error) = self.safety.set_lds_running(true) {
             let _ = self.set_lidar(false);
             return Err(error);
+        }
+        let initial_count = self.current_state_report_count()?;
+        if !self.wait_for_state_reports(initial_count) {
+            let _ = self.set_lidar(false);
+            return Err(Error::Other(format!(
+                "S5 Max LDS started without {OPERATIONAL_REPORT_MINIMUM} fresh state reports"
+            )));
         }
         Ok(())
     }
@@ -540,6 +606,7 @@ impl DeviceDriver for RoborockS5MaxDriver {
             hardware.lds_forward_angle_deg,
         );
         self.dock_state = Some(sensors.dock_state());
+        self.state_report_count = Some(sensors.state_report_count());
         result
             .sensor_data
             .insert("driver_status".to_string(), self.lifecycle.sensor_data());

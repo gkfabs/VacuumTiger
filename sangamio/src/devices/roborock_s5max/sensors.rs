@@ -6,7 +6,7 @@ use crate::core::types::{
     Kinematics, SensorGroupData, SensorValue, StreamSender, create_stream_channel,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 const KEY_REPORT: u8 = 0x06;
@@ -99,6 +99,7 @@ pub(crate) struct SensorGroups {
     pub device_version: Arc<Mutex<SensorGroupData>>,
     pub lidar: Arc<Mutex<SensorGroupData>>,
     safety_sensors: SafetySensors,
+    state_report_count: Arc<AtomicU32>,
     stream_tx: StreamSender,
     wheel_metres_per_tick: f32,
 }
@@ -118,6 +119,7 @@ impl SensorGroups {
         let device_version = group("device_version");
         let lidar = group("lidar");
         let safety_sensors = SafetySensors::new();
+        let state_report_count = Arc::new(AtomicU32::new(0));
         let (stream_tx, stream_rx) = create_stream_channel();
 
         update_group(&device_version, |data| {
@@ -172,6 +174,7 @@ impl SensorGroups {
                 device_version,
                 lidar,
                 safety_sensors,
+                state_report_count,
                 stream_tx,
                 wheel_metres_per_tick: wheel_mm_per_tick / 1000.0,
             },
@@ -251,6 +254,7 @@ impl SensorGroups {
             })
         {
             let _ = self.stream_tx.try_send(snapshot);
+            self.state_report_count.fetch_add(1, Ordering::Release);
         }
 
         self.process_discrete_sensors(frame);
@@ -263,6 +267,10 @@ impl SensorGroups {
 
     pub(crate) fn dock_state(&self) -> Arc<AtomicU16> {
         Arc::clone(&self.safety_sensors.dock)
+    }
+
+    pub(crate) fn state_report_count(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.state_report_count)
     }
 
     pub(crate) fn safety_sensors(&self) -> SafetySensors {
@@ -602,6 +610,7 @@ mod tests {
     use super::SensorGroups;
     use crate::core::types::SensorValue;
     use crate::devices::roborock_s5max::packet::{Frame, FrameDecoder};
+    use std::sync::atomic::Ordering;
 
     fn report_frame(payload: Vec<u8>) -> Frame {
         Frame {
@@ -726,6 +735,23 @@ mod tests {
         assert!(bool_value(data.values.get("cliff_right_front")));
         assert!(bool_value(data.values.get("cliff_right_side")));
         assert!(bool_value(data.values.get("dustbox_attached")));
+    }
+
+    #[test]
+    fn counts_valid_state_reports() {
+        let moving = bytes(
+            "aa5c010740989d853d755710bf326c22416889f43bfd6b943cf8b18bbc865f753cf07d95bcf88ca2bded1e7fbfc4000000f0000000c3cfe14000000000e06e130200000000510888007400433f00005206ffff6501004b42026d00d0020015b4",
+        );
+        let state_frame = FrameDecoder::new().push(&moving).pop().unwrap();
+        let (groups, _) = SensorGroups::create(0.798, 0.229, 261.2);
+        let count = groups.state_report_count();
+
+        groups.process_mcu_frame(&report_frame(vec![0x21, 0x02, 0x00, 0x00]));
+        assert_eq!(count.load(Ordering::Acquire), 0);
+
+        groups.process_mcu_frame(&state_frame);
+        groups.process_mcu_frame(&state_frame);
+        assert_eq!(count.load(Ordering::Acquire), 2);
     }
 
     #[test]
