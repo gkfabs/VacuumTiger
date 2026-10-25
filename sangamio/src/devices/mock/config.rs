@@ -537,6 +537,81 @@ pub struct SensorsConfig {
     pub dock_button: u16,
 }
 
+/// Roborock dock geometry and infrared signal configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DockConfig {
+    #[serde(default)]
+    pub x: f32,
+    #[serde(default)]
+    pub y: f32,
+    #[serde(default)]
+    pub yaw: f32,
+    #[serde(default = "default_dock_signal_range")]
+    pub signal_range: f32,
+    #[serde(default = "default_dock_signal_angle")]
+    pub signal_angle: f32,
+    #[serde(default = "default_dock_center_angle")]
+    pub center_angle: f32,
+    #[serde(default = "default_dock_contact_distance")]
+    pub contact_distance: f32,
+    #[serde(default = "default_dock_contact_lateral")]
+    pub contact_lateral: f32,
+    #[serde(default = "default_dock_contact_yaw")]
+    pub contact_yaw: f32,
+}
+
+/// Deterministic faults for S5 Max docking tests.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DockFaultConfig {
+    /// Hide both dock receivers this many seconds after motion starts.
+    #[serde(default)]
+    pub beacon_blackout_after_sec: Option<f32>,
+    /// Keep both dock receivers hidden for this duration.
+    #[serde(default)]
+    pub beacon_blackout_duration_sec: f32,
+    /// Suppress this many geometric dock contacts.
+    #[serde(default)]
+    pub missed_contact_attempts: u32,
+    /// Delay charging after contact and charger enable.
+    #[serde(default)]
+    pub charging_delay_sec: f32,
+}
+
+fn default_dock_signal_range() -> f32 {
+    1.2
+}
+fn default_dock_signal_angle() -> f32 {
+    0.9
+}
+fn default_dock_center_angle() -> f32 {
+    0.22
+}
+fn default_dock_contact_distance() -> f32 {
+    0.18
+}
+fn default_dock_contact_lateral() -> f32 {
+    0.025
+}
+fn default_dock_contact_yaw() -> f32 {
+    0.10
+}
+
+impl Default for DockConfig {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            yaw: 0.0,
+            signal_range: default_dock_signal_range(),
+            signal_angle: default_dock_signal_angle(),
+            center_angle: default_dock_center_angle(),
+            contact_distance: default_dock_contact_distance(),
+            contact_lateral: default_dock_contact_lateral(),
+            contact_yaw: default_dock_contact_yaw(),
+        }
+    }
+}
+
 impl Default for SensorsConfig {
     fn default() -> Self {
         Self {
@@ -601,6 +676,10 @@ pub struct SimulationConfig {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
+    /// Named deterministic S5 Max docking scenario.
+    #[serde(default = "default_scenario")]
+    pub scenario: String,
+
     /// Robot physical parameters
     #[serde(default)]
     pub robot: RobotConfig,
@@ -632,6 +711,14 @@ pub struct SimulationConfig {
     /// Actuator configuration
     #[serde(default)]
     pub actuators: ActuatorsConfig,
+
+    /// Roborock dock model. The generic mock ignores this value.
+    #[serde(default)]
+    pub dock: DockConfig,
+
+    /// Fault injection for the S5 Max dock model.
+    #[serde(default)]
+    pub dock_faults: DockFaultConfig,
 }
 
 fn default_speed_factor() -> f32 {
@@ -639,6 +726,9 @@ fn default_speed_factor() -> f32 {
 }
 fn default_log_level() -> String {
     "standard".to_string()
+}
+fn default_scenario() -> String {
+    "centered".to_string()
 }
 
 impl Default for SimulationConfig {
@@ -651,6 +741,7 @@ impl Default for SimulationConfig {
             speed_factor: default_speed_factor(),
             random_seed: 0,
             log_level: default_log_level(),
+            scenario: default_scenario(),
             robot: RobotConfig::default(),
             lidar: LidarConfig::default(),
             imu: ImuConfig::default(),
@@ -659,6 +750,8 @@ impl Default for SimulationConfig {
             cliffs: CliffsConfig::default(),
             sensors: SensorsConfig::default(),
             actuators: ActuatorsConfig::default(),
+            dock: DockConfig::default(),
+            dock_faults: DockFaultConfig::default(),
         }
     }
 }

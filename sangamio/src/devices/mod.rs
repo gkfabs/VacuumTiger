@@ -43,6 +43,7 @@ use mock::MockDriver;
 /// - `crl200s`: Real CRL-200S robot hardware
 /// - `roborock_s5max`: Roborock S5 Max hardware
 /// - `mock`: Simulated robot for algorithm testing (requires `mock` feature)
+/// - `roborock_s5max_mock`: Simulated Roborock S5 Max (requires `mock` feature)
 ///
 /// To add a new device type, add a match arm here:
 /// ```ignore
@@ -59,7 +60,7 @@ pub fn create_device(config: &Config) -> Result<Box<dyn DeviceDriver>> {
             Ok(Box::new(driver))
         }
         #[cfg(feature = "mock")]
-        "mock" => {
+        "mock" | "roborock_s5max_mock" => {
             let driver = MockDriver::new(config.device.clone())?;
             Ok(Box::new(driver))
         }

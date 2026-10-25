@@ -1,0 +1,62 @@
+[device]
+type = "roborock_s5max_mock"
+name = "Roborock S5 Max Simulator"
+
+[device.simulation]
+map_file = "maps/simple_room.yaml"
+start_x = 1.98
+start_y = 1.50
+start_theta = 0.0
+speed_factor = 1.0
+random_seed = 42
+log_level = "standard"
+scenario = "centered"
+
+[device.simulation.robot]
+collision_mode = "stop"
+
+[device.simulation.lidar]
+num_rays = 360
+scan_rate_hz = 5.0
+min_range = 0.10
+max_range = 8.0
+
+[device.simulation.lidar.noise]
+range_stddev = 0.005
+angle_stddev = 0.001
+miss_rate = 0.01
+quality_base = 200
+quality_distance_decay = 10
+
+[device.simulation.encoder.noise]
+slip_stddev = 0.002
+slip_bias = 0.0
+quantization_noise = true
+
+[device.simulation.cliffs]
+enabled = false
+
+[device.simulation.sensors]
+dustbox_attached = true
+
+[device.simulation.sensors.battery]
+voltage = 14.4
+level = 75
+
+[device.simulation.dock]
+x = 2.60
+y = 1.50
+yaw = 0.0
+signal_range = 1.20
+signal_angle = 0.90
+center_angle = 0.05
+contact_distance = 0.18
+contact_lateral = 0.025
+contact_yaw = 0.10
+
+[device.simulation.actuators]
+log_state_changes = true
+
+[network]
+bind_address = "0.0.0.0:5555"
+udp_client_port = 5555

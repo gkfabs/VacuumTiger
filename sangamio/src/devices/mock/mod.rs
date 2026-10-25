@@ -138,7 +138,7 @@ use crate::core::driver::{DeviceDriver, DriverInitResult};
 use crate::core::types::{Command, Kinematics, SensorGroupData, SensorValue};
 use crate::error::{Error, Result};
 
-use config::SimulationConfig;
+use config::{DockFaultConfig, SimulationConfig};
 use encoder_sim::EncoderSimulator;
 use imu_sim::ImuSimulator;
 use lidar_sim::LidarSimulator;
@@ -149,10 +149,166 @@ use sensor_sim::{ActuatorState, BumperSimulator, CliffSimulator};
 
 use crossbeam_channel::Sender;
 use std::collections::HashMap;
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MockProfile {
+    Generic,
+    RoborockS5Max,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ExternalPose {
+    x: f32,
+    y: f32,
+    yaw: f32,
+    linear_velocity: f32,
+    angular_velocity: f32,
+    bumper_left: bool,
+    bumper_right: bool,
+}
+
+fn parse_external_pose(packet: &[u8]) -> Option<ExternalPose> {
+    let text = std::str::from_utf8(packet).ok()?.trim();
+    let values: Vec<&str> = text.split(',').collect();
+    if values.len() != 7 {
+        return None;
+    }
+    Some(ExternalPose {
+        x: values[0].parse().ok()?,
+        y: values[1].parse().ok()?,
+        yaw: values[2].parse().ok()?,
+        linear_velocity: values[3].parse().ok()?,
+        angular_velocity: values[4].parse().ok()?,
+        bumper_left: values[5] == "1",
+        bumper_right: values[6] == "1",
+    })
+}
+
+fn wrap_angle(angle: f32) -> f32 {
+    let mut value = angle % std::f32::consts::TAU;
+    if value >= std::f32::consts::PI {
+        value -= std::f32::consts::TAU;
+    } else if value < -std::f32::consts::PI {
+        value += std::f32::consts::TAU;
+    }
+    value
+}
+
+fn dock_observation(config: &SimulationConfig, x: f32, y: f32, yaw: f32) -> (u16, u16, bool) {
+    let dock = &config.dock;
+    let dx = dock.x - x;
+    let dy = dock.y - y;
+    let forward = dx * dock.yaw.cos() + dy * dock.yaw.sin();
+    let lateral = -dx * dock.yaw.sin() + dy * dock.yaw.cos();
+    let sight_bearing = wrap_angle(dy.atan2(dx) - yaw);
+    let heading_error = wrap_angle(dock.yaw - yaw);
+    let guidance = wrap_angle(heading_error + lateral.atan2(forward.max(0.40)));
+    let visible = dx.hypot(dy) <= dock.signal_range && sight_bearing.abs() <= dock.signal_angle;
+    let close_centered = forward <= 0.45
+        && lateral.abs() <= dock.contact_lateral.max(0.03)
+        && heading_error.abs() <= dock.contact_yaw;
+    let masks = if !visible {
+        (0, 0)
+    } else if close_centered {
+        (0x14, 0x18)
+    } else if guidance > dock.center_angle {
+        (0x15, 0)
+    } else if guidance < -dock.center_angle {
+        (0, 0x1a)
+    } else {
+        (0x12, 0x12)
+    };
+    let contact = (forward - dock.contact_distance).abs() <= 0.025
+        && lateral.abs() <= dock.contact_lateral
+        && wrap_angle(yaw - dock.yaw).abs() <= dock.contact_yaw;
+    (masks.0, masks.1, contact)
+}
+
+fn apply_s5max_scenario(config: &mut SimulationConfig, scenario: &str) -> Result<()> {
+    config.dock_faults = DockFaultConfig::default();
+    match scenario {
+        "centered" => {}
+        "lateral-offset" => {
+            config.start_y = config.dock.y + 0.12;
+            config.start_theta = config.dock.yaw;
+        }
+        "heading-error" => {
+            config.start_y = config.dock.y;
+            config.start_theta = config.dock.yaw + 0.12;
+        }
+        "beacon-loss" => {
+            config.dock_faults.beacon_blackout_after_sec = Some(2.0);
+            config.dock_faults.beacon_blackout_duration_sec = 1.5;
+        }
+        "missed-contact" => {
+            config.dock_faults.missed_contact_attempts = 1;
+        }
+        "delayed-charging" => {
+            config.dock_faults.charging_delay_sec = 2.5;
+        }
+        _ => {
+            return Err(Error::Config(format!(
+                "unknown S5 Max mock scenario: {scenario}"
+            )));
+        }
+    }
+    config.scenario = scenario.to_string();
+    Ok(())
+}
+
+#[derive(Default)]
+struct DockFaultState {
+    previous_geometric_contact: bool,
+    contact_attempts: u32,
+    accepted_contact: bool,
+    charging_since: Option<Instant>,
+}
+
+impl DockFaultState {
+    fn update(
+        &mut self,
+        faults: &DockFaultConfig,
+        geometric_contact: bool,
+        charger_enabled: bool,
+        now: Instant,
+    ) -> (bool, bool) {
+        if geometric_contact && !self.previous_geometric_contact {
+            self.contact_attempts += 1;
+            self.accepted_contact = self.contact_attempts > faults.missed_contact_attempts;
+        } else if !geometric_contact {
+            self.accepted_contact = false;
+        }
+        self.previous_geometric_contact = geometric_contact;
+
+        let contact = geometric_contact && self.accepted_contact;
+        if contact && charger_enabled {
+            let started = self.charging_since.get_or_insert(now);
+            let charging =
+                now.duration_since(*started).as_secs_f32() >= faults.charging_delay_sec.max(0.0);
+            (contact, charging)
+        } else {
+            self.charging_since = None;
+            (contact, false)
+        }
+    }
+}
+
+fn signal_blacked_out(
+    faults: &DockFaultConfig,
+    motion_started_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let (Some(after), Some(started)) = (faults.beacon_blackout_after_sec, motion_started_at) else {
+        return false;
+    };
+    let elapsed = now.duration_since(started).as_secs_f32();
+    elapsed >= after && elapsed < after + faults.beacon_blackout_duration_sec.max(0.0)
+}
 
 /// Atomic f32 wrapper using AtomicU32
 struct AtomicF32(AtomicU32);
@@ -214,20 +370,38 @@ pub struct MockDriver {
     shared_state: Arc<SharedState>,
     simulation_handle: Option<JoinHandle<()>>,
     actuator_state: Arc<Mutex<ActuatorState>>,
+    profile: MockProfile,
 }
 
 impl MockDriver {
     /// Create a new mock driver from device configuration
     pub fn new(device_config: DeviceConfig) -> Result<Self> {
-        let sim_config = device_config.simulation.ok_or_else(|| {
+        let profile = if device_config.device_type == "roborock_s5max_mock" {
+            MockProfile::RoborockS5Max
+        } else {
+            MockProfile::Generic
+        };
+        let mut sim_config = device_config.simulation.ok_or_else(|| {
             Error::Config("Mock device requires simulation configuration".to_string())
         })?;
+        if profile == MockProfile::RoborockS5Max {
+            sim_config.robot.wheel_base = 0.229;
+            sim_config.robot.ticks_per_meter = 1.0 / 0.00079799996;
+            sim_config.robot.max_linear_speed = 0.30;
+            sim_config.robot.max_angular_speed = 1.60;
+            sim_config.robot.robot_radius = 0.1765;
+            let scenario = std::env::var("SANGAMIO_MOCK_SCENARIO")
+                .unwrap_or_else(|_| sim_config.scenario.clone());
+            apply_s5max_scenario(&mut sim_config, &scenario)?;
+            log::info!("S5 Max mock scenario: {scenario}");
+        }
 
         Ok(Self {
             config: sim_config,
             shared_state: Arc::new(SharedState::new()),
             simulation_handle: None,
             actuator_state: Arc::new(Mutex::new(ActuatorState::new())),
+            profile,
         })
     }
 
@@ -237,6 +411,106 @@ impl MockDriver {
         if let Some(handle) = self.simulation_handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod s5max_mock_tests {
+    use super::*;
+
+    fn config() -> SimulationConfig {
+        SimulationConfig {
+            dock: config::DockConfig {
+                x: 1.0,
+                y: 0.0,
+                yaw: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn dock_signal_reports_both_receivers_on_center_line() {
+        let (left, right, contact) = dock_observation(&config(), 0.5, 0.0, 0.0);
+        assert_eq!((left, right), (0x12, 0x12));
+        assert!(!contact);
+    }
+
+    #[test]
+    fn dock_signal_reports_close_classes_only_after_final_alignment() {
+        let (left, right, contact) = dock_observation(&config(), 0.7, 0.0, 0.0);
+        assert_eq!((left, right), (0x14, 0x18));
+        assert!(!contact);
+    }
+
+    #[test]
+    fn dock_signal_selects_the_receiver_for_lateral_error() {
+        let (left, right, _) = dock_observation(&config(), 0.5, -0.2, 0.0);
+        assert_ne!(left, 0);
+        assert_eq!(right, 0);
+    }
+
+    #[test]
+    fn dock_contact_requires_position_and_heading_alignment() {
+        let (_, _, contact) = dock_observation(&config(), 0.82, 0.0, 0.0);
+        assert!(contact);
+        let (_, _, lateral_miss) = dock_observation(&config(), 0.82, 0.04, 0.0);
+        assert!(!lateral_miss);
+        let (_, _, yaw_miss) = dock_observation(&config(), 0.82, 0.0, 0.2);
+        assert!(!yaw_miss);
+    }
+
+    #[test]
+    fn scenario_presets_are_deterministic() {
+        let mut lateral = config();
+        apply_s5max_scenario(&mut lateral, "lateral-offset").unwrap();
+        assert_eq!(lateral.start_y, 0.12);
+
+        let mut delayed = config();
+        apply_s5max_scenario(&mut delayed, "delayed-charging").unwrap();
+        assert_eq!(delayed.dock_faults.charging_delay_sec, 2.5);
+    }
+
+    #[test]
+    fn external_pose_packet_preserves_gazebo_observation() {
+        let pose = parse_external_pose(b"2.1,1.4,-0.2,0.03,-0.1,1,0").unwrap();
+
+        assert_eq!(pose.x, 2.1);
+        assert_eq!(pose.y, 1.4);
+        assert_eq!(pose.yaw, -0.2);
+        assert_eq!(pose.linear_velocity, 0.03);
+        assert_eq!(pose.angular_velocity, -0.1);
+        assert!(pose.bumper_left);
+        assert!(!pose.bumper_right);
+    }
+
+    #[test]
+    fn missed_contact_accepts_the_next_attempt() {
+        let faults = DockFaultConfig {
+            missed_contact_attempts: 1,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let mut state = DockFaultState::default();
+        assert_eq!(state.update(&faults, true, false, now), (false, false));
+        state.update(&faults, false, false, now);
+        assert_eq!(state.update(&faults, true, false, now), (true, false));
+    }
+
+    #[test]
+    fn charging_delay_uses_stable_contact_time() {
+        let faults = DockFaultConfig {
+            charging_delay_sec: 2.5,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        let mut state = DockFaultState::default();
+        assert_eq!(state.update(&faults, true, true, now), (true, false));
+        assert_eq!(
+            state.update(&faults, true, true, now + Duration::from_secs(3)),
+            (true, true)
+        );
     }
 }
 
@@ -268,6 +542,7 @@ impl DeviceDriver for MockDriver {
         let sensor_status = Arc::new(Mutex::new(SensorGroupData::new("sensor_status")));
         let lidar_data = Arc::new(Mutex::new(SensorGroupData::new("lidar")));
         let version_data = Arc::new(Mutex::new(SensorGroupData::new("device_version")));
+        let dock_ir = Arc::new(Mutex::new(SensorGroupData::new("dock_ir")));
 
         // Set version info
         {
@@ -276,7 +551,11 @@ impl DeviceDriver for MockDriver {
                 .map_err(|e| Error::MutexPoisoned(format!("version_data lock failed: {}", e)))?;
             ver.set(
                 "version_string",
-                SensorValue::String("MockDevice v1.0".to_string()),
+                SensorValue::String(if self.profile == MockProfile::RoborockS5Max {
+                    "Roborock S5 Max Mock v1.0".to_string()
+                } else {
+                    "MockDevice v1.0".to_string()
+                }),
             );
             ver.set("version_code", SensorValue::I32(100));
             ver.touch();
@@ -291,6 +570,8 @@ impl DeviceDriver for MockDriver {
         let sensor_status_clone = Arc::clone(&sensor_status);
         let lidar_data_clone = Arc::clone(&lidar_data);
         let actuator_state_clone = Arc::clone(&self.actuator_state);
+        let dock_ir_clone = Arc::clone(&dock_ir);
+        let profile = self.profile;
 
         // Spawn simulation thread
         let handle = thread::Builder::new()
@@ -306,6 +587,8 @@ impl DeviceDriver for MockDriver {
                     lidar_data_clone,
                     stream_tx,
                     actuator_state_clone,
+                    dock_ir_clone,
+                    profile,
                 );
             })
             .map_err(|e| Error::Other(format!("Failed to spawn simulation thread: {}", e)))?;
@@ -319,9 +602,20 @@ impl DeviceDriver for MockDriver {
         sensor_data.insert("sensor_status".to_string(), sensor_status);
         sensor_data.insert("lidar".to_string(), lidar_data);
         sensor_data.insert("device_version".to_string(), version_data);
+        if self.profile == MockProfile::RoborockS5Max {
+            sensor_data.insert("dock_ir".to_string(), dock_ir);
+        }
         let kinematics = Kinematics {
-            wheel_m_per_tick: 1.0 / self.config.robot.ticks_per_meter,
-            wheel_track_m: self.config.robot.wheel_base,
+            wheel_m_per_tick: if self.profile == MockProfile::RoborockS5Max {
+                0.00079799996
+            } else {
+                1.0 / self.config.robot.ticks_per_meter
+            },
+            wheel_track_m: if self.profile == MockProfile::RoborockS5Max {
+                0.229
+            } else {
+                self.config.robot.wheel_base
+            },
             wheel_tick_bits: 16,
             gyro_rad_per_lsb: 1.0 / imu_sim::GYRO_SCALE,
             accel_mps2_per_lsb: Some(9.81 / imu_sim::ACCEL_SCALE),
@@ -358,11 +652,12 @@ impl DeviceDriver for MockDriver {
                                 log::debug!("Drive enabled (wheel motors on)");
                             }
                             crate::core::types::ComponentAction::Configure { config } => {
-                                if !self
-                                    .shared_state
-                                    .components
-                                    .wheel_motor_enabled
-                                    .load(Ordering::Relaxed)
+                                if self.profile != MockProfile::RoborockS5Max
+                                    && !self
+                                        .shared_state
+                                        .components
+                                        .wheel_motor_enabled
+                                        .load(Ordering::Relaxed)
                                 {
                                     log::warn!(
                                         "Drive command ignored: wheel motors not enabled (send Enable first)"
@@ -466,6 +761,8 @@ fn simulation_loop(
     lidar_data: Arc<Mutex<SensorGroupData>>,
     stream_tx: Sender<SensorGroupData>,
     _actuator_state: Arc<Mutex<ActuatorState>>,
+    dock_ir: Arc<Mutex<SensorGroupData>>,
+    profile: MockProfile,
 ) {
     // Create simulators
     let mut lidar_sim = LidarSimulator::new(&config.lidar, noise.clone());
@@ -483,6 +780,26 @@ fn simulation_loop(
 
     let mut last_time = Instant::now();
     let mut lidar_tick_counter: u32 = 0;
+    let mut motion_started_at = None;
+    let mut dock_fault_state = DockFaultState::default();
+    let external_pose_socket = std::env::var("SANGAMIO_MOCK_POSE_UDP")
+        .ok()
+        .and_then(|address| match UdpSocket::bind(&address) {
+            Ok(socket) => {
+                if let Err(error) = socket.set_nonblocking(true) {
+                    log::error!("Cannot make the external pose socket nonblocking: {error}");
+                    return None;
+                }
+                log::info!("External Gazebo pose input is active on {address}");
+                Some(socket)
+            }
+            Err(error) => {
+                log::error!("Cannot bind the external pose socket at {address}: {error}");
+                None
+            }
+        });
+    let mut external_pose = None;
+    let mut external_pose_buffer = [0_u8; 256];
 
     log::info!(
         "Simulation loop started: speed_factor={}, interval={:?}",
@@ -502,29 +819,81 @@ fn simulation_loop(
         // Read velocity commands
         let linear_vel = shared.linear_vel.load(Ordering::Relaxed);
         let angular_vel = shared.angular_vel.load(Ordering::Relaxed);
+        if motion_started_at.is_none() && (linear_vel.abs() > 1e-4 || angular_vel.abs() > 1e-4) {
+            motion_started_at = Some(now);
+        }
 
-        // Update physics
-        let collision = physics.update(sim_dt, linear_vel, angular_vel, &map, &config.robot);
+        if let Some(socket) = &external_pose_socket {
+            while let Ok(size) = socket.recv(&mut external_pose_buffer) {
+                if let Some(pose) = parse_external_pose(&external_pose_buffer[..size]) {
+                    external_pose = Some(pose);
+                }
+            }
+        }
+
+        // Use Gazebo as the physics source when it supplies an external pose.
+        let (observed_linear_vel, observed_angular_vel, collision) = if let Some(pose) =
+            external_pose
+        {
+            physics.set_pose(pose.x, pose.y, pose.yaw);
+            (pose.linear_velocity, pose.angular_velocity, false)
+        } else {
+            let collision = physics.update(sim_dt, linear_vel, angular_vel, &map, &config.robot);
+            (linear_vel, angular_vel, collision)
+        };
         if collision && config.log_level != "minimal" {
             log::debug!("Collision at ({:.3}, {:.3})", physics.x(), physics.y());
         }
 
         // Generate encoder data
-        let (left_vel, right_vel) =
-            physics.wheel_velocities(linear_vel, angular_vel, config.robot.wheel_base);
+        let (left_vel, right_vel) = physics.wheel_velocities(
+            observed_linear_vel,
+            observed_angular_vel,
+            config.robot.wheel_base,
+        );
         let (wheel_left, wheel_right) = encoder_sim.update(left_vel, right_vel, sim_dt);
 
         // Generate IMU data
-        let imu_reading = imu_sim.generate(angular_vel, linear_vel, sim_dt);
+        let imu_reading = imu_sim.generate(observed_angular_vel, observed_linear_vel, sim_dt);
 
         // Check bumpers and cliffs
-        let (bumper_left, bumper_right) = bumper_sim.check(
-            &map,
-            physics.x(),
-            physics.y(),
-            physics.theta(),
-            config.robot.robot_radius,
-        );
+        let (bumper_left, bumper_right) = if let Some(pose) = external_pose {
+            (pose.bumper_left, pose.bumper_right)
+        } else {
+            bumper_sim.check(
+                &map,
+                physics.x(),
+                physics.y(),
+                physics.theta(),
+                config.robot.robot_radius,
+            )
+        };
+        let (mut dock_left_mask, mut dock_right_mask, geometric_dock_contact) =
+            if profile == MockProfile::RoborockS5Max {
+                dock_observation(&config, physics.x(), physics.y(), physics.theta())
+            } else {
+                (0, 0, config.sensors.dock_connected)
+            };
+        if profile == MockProfile::RoborockS5Max
+            && signal_blacked_out(&config.dock_faults, motion_started_at, now)
+        {
+            dock_left_mask = 0;
+            dock_right_mask = 0;
+        }
+        let charger_enabled = _actuator_state
+            .lock()
+            .map(|state| state.is_enabled("charger"))
+            .unwrap_or(false);
+        let (dock_contact, dock_charging) = if profile == MockProfile::RoborockS5Max {
+            dock_fault_state.update(
+                &config.dock_faults,
+                geometric_dock_contact,
+                charger_enabled,
+                now,
+            )
+        } else {
+            (geometric_dock_contact, config.sensors.battery.is_charging)
+        };
         let cliff_states = cliff_sim.check(&map, physics.x(), physics.y(), physics.theta());
 
         // Build sensor_status
@@ -542,8 +911,14 @@ fn simulation_loop(
             status.set("tilt_y", SensorValue::I16(imu_reading.tilt[1]));
             status.set("tilt_z", SensorValue::I16(imu_reading.tilt[2]));
 
-            status.set("bumper_left", SensorValue::Bool(bumper_left));
-            status.set("bumper_right", SensorValue::Bool(bumper_right));
+            status.set(
+                "bumper_left",
+                SensorValue::Bool(bumper_left || dock_contact),
+            );
+            status.set(
+                "bumper_right",
+                SensorValue::Bool(bumper_right || dock_contact),
+            );
 
             // Cliff sensors
             status.set(
@@ -574,7 +949,11 @@ fn simulation_loop(
             );
             status.set(
                 "is_charging",
-                SensorValue::Bool(config.sensors.battery.is_charging),
+                SensorValue::Bool(if profile == MockProfile::RoborockS5Max {
+                    dock_charging
+                } else {
+                    config.sensors.battery.is_charging
+                }),
             );
 
             // Other sensors (fixed)
@@ -584,7 +963,11 @@ fn simulation_loop(
             );
             status.set(
                 "is_dock_connected",
-                SensorValue::Bool(config.sensors.dock_connected),
+                SensorValue::Bool(if profile == MockProfile::RoborockS5Max {
+                    dock_contact
+                } else {
+                    config.sensors.dock_connected
+                }),
             );
             status.set(
                 "start_button",
@@ -596,6 +979,14 @@ fn simulation_loop(
 
             // Send to streaming channel
             let _ = stream_tx.try_send(status.clone());
+        }
+
+        if profile == MockProfile::RoborockS5Max
+            && let Ok(mut signal) = dock_ir.lock()
+        {
+            signal.set("left_mask", SensorValue::U16(dock_left_mask));
+            signal.set("right_mask", SensorValue::U16(dock_right_mask));
+            signal.touch();
         }
 
         // Generate lidar scan periodically (only if lidar is enabled)

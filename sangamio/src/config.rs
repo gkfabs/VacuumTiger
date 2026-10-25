@@ -697,7 +697,7 @@ impl Config {
                 }
             }
             #[cfg(feature = "mock")]
-            "mock" => {
+            "mock" | "roborock_s5max_mock" => {
                 // Simulation config is required for mock device
                 let simulation = self.device.simulation.as_ref().ok_or_else(|| {
                     Error::Config("mock device requires [device.simulation] section".to_string())
@@ -716,7 +716,7 @@ impl Config {
                 }
             }
             #[cfg(not(feature = "mock"))]
-            "mock" => {
+            "mock" | "roborock_s5max_mock" => {
                 return Err(Error::Config(
                     "Mock device not available: rebuild with --features mock".to_string(),
                 ));

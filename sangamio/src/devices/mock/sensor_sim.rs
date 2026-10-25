@@ -174,6 +174,12 @@ impl ActuatorState {
             }
         }
     }
+
+    pub fn is_enabled(&self, id: &str) -> bool {
+        self.states
+            .get(id)
+            .is_some_and(|state| state.starts_with("enabled"))
+    }
 }
 
 impl Default for ActuatorState {

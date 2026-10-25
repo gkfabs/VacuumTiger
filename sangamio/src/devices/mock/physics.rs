@@ -75,6 +75,13 @@ impl PhysicsState {
         self.theta
     }
 
+    /// Replace the pose with an external physics-engine observation.
+    pub fn set_pose(&mut self, x: f32, y: f32, theta: f32) {
+        self.x = x;
+        self.y = y;
+        self.theta = normalize_angle(theta);
+    }
+
     /// Update physics state based on velocity commands
     ///
     /// Returns true if a collision occurred.
