@@ -95,7 +95,6 @@ pub(crate) struct SensorGroups {
     pub attachments: Arc<Mutex<SensorGroupData>>,
     pub motor_status: Arc<Mutex<SensorGroupData>>,
     pub errors: Arc<Mutex<SensorGroupData>>,
-    pub dock_ir: Arc<Mutex<SensorGroupData>>,
     pub device_version: Arc<Mutex<SensorGroupData>>,
     pub lidar: Arc<Mutex<SensorGroupData>>,
     safety_sensors: SafetySensors,
@@ -115,7 +114,6 @@ impl SensorGroups {
         let attachments = group("attachments");
         let motor_status = group("motor_status");
         let errors = group("errors");
-        let dock_ir = group("dock_ir");
         let device_version = group("device_version");
         let lidar = group("lidar");
         let safety_sensors = SafetySensors::new();
@@ -154,7 +152,6 @@ impl SensorGroups {
             ("attachments", Arc::clone(&attachments)),
             ("motor_status", Arc::clone(&motor_status)),
             ("errors", Arc::clone(&errors)),
-            ("dock_ir", Arc::clone(&dock_ir)),
             ("device_version", Arc::clone(&device_version)),
             ("lidar", Arc::clone(&lidar)),
         ]
@@ -170,7 +167,6 @@ impl SensorGroups {
                 attachments,
                 motor_status,
                 errors,
-                dock_ir,
                 device_version,
                 lidar,
                 safety_sensors,
@@ -532,50 +528,15 @@ impl SensorGroups {
         let Some(report) = frame.dock_ir_report() else {
             return;
         };
-        update_group(&self.dock_ir, |data| {
-            data.set("left_mask", SensorValue::U8(report.left_receiver.0));
-            data.set("right_mask", SensorValue::U8(report.right_receiver.0));
+        if let Some(snapshot) = update_group(&self.sensor_status, |data| {
+            data.set("dock_ir_left_mask", SensorValue::U8(report.left_receiver.0));
             data.set(
-                "left_far_left",
-                SensorValue::Bool(report.left_receiver.beacon_left()),
+                "dock_ir_right_mask",
+                SensorValue::U8(report.right_receiver.0),
             );
-            data.set(
-                "left_far_right",
-                SensorValue::Bool(report.left_receiver.beacon_right()),
-            );
-            data.set(
-                "left_close_left",
-                SensorValue::Bool(report.left_receiver.code_84()),
-            );
-            data.set(
-                "left_close_right",
-                SensorValue::Bool(report.left_receiver.code_88()),
-            );
-            data.set(
-                "left_common",
-                SensorValue::Bool(report.left_receiver.majority_pattern()),
-            );
-            data.set(
-                "right_far_left",
-                SensorValue::Bool(report.right_receiver.beacon_left()),
-            );
-            data.set(
-                "right_far_right",
-                SensorValue::Bool(report.right_receiver.beacon_right()),
-            );
-            data.set(
-                "right_close_left",
-                SensorValue::Bool(report.right_receiver.code_84()),
-            );
-            data.set(
-                "right_close_right",
-                SensorValue::Bool(report.right_receiver.code_88()),
-            );
-            data.set(
-                "right_common",
-                SensorValue::Bool(report.right_receiver.majority_pattern()),
-            );
-        });
+        }) {
+            let _ = self.stream_tx.try_send(snapshot);
+        }
     }
 
     fn process_version(&self, frame: &Frame) {
@@ -776,6 +737,25 @@ mod tests {
         assert!(matches!(
             data.values.get("battery_voltage"),
             Some(SensorValue::F32(value)) if (*value - 16.390).abs() < f32::EPSILON
+        ));
+    }
+
+    #[test]
+    fn publishes_dock_ir_masks_in_sensor_status() {
+        let input = bytes(
+            "aa62010740bff0f33e6ce4ffbe83071b416889f43b0f5b07bdd8ba2fbfcd649fbcaedd803c484274bf0fbe983ec77c0400470505007de5c73e000000007437920300000000510817000300190400005206ffffb001004a42021b00130418001000d00200d077",
+        );
+        let frame = FrameDecoder::new().push(&input).pop().unwrap();
+        let (groups, _) = SensorGroups::create(0.798, 0.229, 261.2);
+        groups.process_mcu_frame(&frame);
+        let data = groups.sensor_status.lock().unwrap();
+        assert!(matches!(
+            data.values.get("dock_ir_left_mask"),
+            Some(SensorValue::U8(0x18))
+        ));
+        assert!(matches!(
+            data.values.get("dock_ir_right_mask"),
+            Some(SensorValue::U8(0x10))
         ));
     }
 }
