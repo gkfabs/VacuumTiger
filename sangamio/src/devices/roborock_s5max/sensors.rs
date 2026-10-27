@@ -529,7 +529,10 @@ impl SensorGroups {
             return;
         };
         if let Some(snapshot) = update_group(&self.sensor_status, |data| {
-            data.set("dock_ir_left_mask", SensorValue::U8(report.left_receiver.0));
+            data.set(
+                "dock_ir_front_mask",
+                SensorValue::U8(report.front_receiver.0),
+            );
             data.set(
                 "dock_ir_right_mask",
                 SensorValue::U8(report.right_receiver.0),
@@ -750,7 +753,7 @@ mod tests {
         groups.process_mcu_frame(&frame);
         let data = groups.sensor_status.lock().unwrap();
         assert!(matches!(
-            data.values.get("dock_ir_left_mask"),
+            data.values.get("dock_ir_front_mask"),
             Some(SensorValue::U8(0x18))
         ));
         assert!(matches!(

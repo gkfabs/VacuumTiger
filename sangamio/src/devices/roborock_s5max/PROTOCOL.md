@@ -194,7 +194,7 @@ Record `0x13/len4` uses this layout:
 
 | Byte | Meaning                              |
 |-----:|--------------------------------------|
-|    0 | Rolling mask from the left receiver  |
+|    0 | Rolling mask from the front receiver |
 |    1 | Reserved                             |
 |    2 | Rolling mask from the right receiver |
 |    3 | Reserved                             |

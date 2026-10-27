@@ -369,7 +369,7 @@ impl DockIrCodeMask {
 /// Four-byte report `0x13`, built from a rolling six-entry OR history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DockIrReport {
-    pub left_receiver: DockIrCodeMask,
+    pub front_receiver: DockIrCodeMask,
     pub right_receiver: DockIrCodeMask,
     pub reserved_byte_1: u8,
     pub reserved_byte_3: u8,
@@ -709,7 +709,7 @@ impl Frame {
     pub fn dock_ir_report(&self) -> Option<DockIrReport> {
         let bytes = self.embedded_report(DOCK_IR_REPORT_MESSAGE, DOCK_IR_REPORT_LENGTH)?;
         Some(DockIrReport {
-            left_receiver: DockIrCodeMask(bytes[0]),
+            front_receiver: DockIrCodeMask(bytes[0]),
             reserved_byte_1: bytes[1],
             right_receiver: DockIrCodeMask(bytes[2]),
             reserved_byte_3: bytes[3],
@@ -1334,13 +1334,13 @@ mod tests {
         let frame = decoder.push(&input).pop().unwrap();
         assert!(frame.crc_valid);
         let report = frame.dock_ir_report().unwrap();
-        assert_eq!(report.left_receiver, super::DockIrCodeMask(0x18));
+        assert_eq!(report.front_receiver, super::DockIrCodeMask(0x18));
         assert_eq!(report.right_receiver, super::DockIrCodeMask(0x10));
         assert_eq!((report.reserved_byte_1, report.reserved_byte_3), (0, 0));
-        assert!(report.left_receiver.code_88());
-        assert!(report.left_receiver.majority_pattern());
-        assert!(!report.left_receiver.beacon_left());
-        assert!(!report.left_receiver.beacon_right());
+        assert!(report.front_receiver.code_88());
+        assert!(report.front_receiver.majority_pattern());
+        assert!(!report.front_receiver.beacon_left());
+        assert!(!report.front_receiver.beacon_right());
     }
 
     #[test]

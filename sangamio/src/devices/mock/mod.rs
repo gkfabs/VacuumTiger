@@ -209,19 +209,14 @@ fn dock_observation(config: &SimulationConfig, x: f32, y: f32, yaw: f32) -> (u16
     let heading_error = wrap_angle(dock.yaw - yaw);
     let guidance = wrap_angle(heading_error + lateral.atan2(forward.max(0.40)));
     let visible = dx.hypot(dy) <= dock.signal_range && sight_bearing.abs() <= dock.signal_angle;
-    let close_centered = forward <= 0.45
-        && lateral.abs() <= dock.contact_lateral.max(0.03)
-        && heading_error.abs() <= dock.contact_yaw;
     let masks = if !visible {
         (0, 0)
-    } else if close_centered {
-        (0x14, 0x18)
     } else if guidance > dock.center_angle {
-        (0x15, 0)
+        (0x1a, 0x18)
     } else if guidance < -dock.center_angle {
-        (0, 0x1a)
+        (0, 0x15)
     } else {
-        (0x12, 0x12)
+        (0x15, 0x18)
     };
     let contact = (forward - dock.contact_distance).abs() <= 0.025
         && lateral.abs() <= dock.contact_lateral
@@ -432,23 +427,23 @@ mod s5max_mock_tests {
 
     #[test]
     fn dock_signal_reports_both_receivers_on_center_line() {
-        let (left, right, contact) = dock_observation(&config(), 0.5, 0.0, 0.0);
-        assert_eq!((left, right), (0x12, 0x12));
+        let (front, right, contact) = dock_observation(&config(), 0.5, 0.0, 0.0);
+        assert_eq!((front, right), (0x15, 0x18));
         assert!(!contact);
     }
 
     #[test]
-    fn dock_signal_reports_close_classes_only_after_final_alignment() {
-        let (left, right, contact) = dock_observation(&config(), 0.7, 0.0, 0.0);
-        assert_eq!((left, right), (0x14, 0x18));
+    fn dock_signal_keeps_the_center_pattern_near_the_dock() {
+        let (front, right, contact) = dock_observation(&config(), 0.7, 0.0, 0.0);
+        assert_eq!((front, right), (0x15, 0x18));
         assert!(!contact);
     }
 
     #[test]
-    fn dock_signal_selects_the_receiver_for_lateral_error() {
-        let (left, right, _) = dock_observation(&config(), 0.5, -0.2, 0.0);
-        assert_ne!(left, 0);
-        assert_eq!(right, 0);
+    fn dock_signal_uses_overlapping_front_and_right_receivers() {
+        let (front, right, _) = dock_observation(&config(), 0.5, -0.2, 0.0);
+        assert_eq!(front, 0x1a);
+        assert_eq!(right, 0x18);
     }
 
     #[test]
@@ -868,7 +863,7 @@ fn simulation_loop(
                 config.robot.robot_radius,
             )
         };
-        let (mut dock_left_mask, mut dock_right_mask, geometric_dock_contact) =
+        let (mut dock_front_mask, mut dock_right_mask, geometric_dock_contact) =
             if profile == MockProfile::RoborockS5Max {
                 dock_observation(&config, physics.x(), physics.y(), physics.theta())
             } else {
@@ -877,7 +872,7 @@ fn simulation_loop(
         if profile == MockProfile::RoborockS5Max
             && signal_blacked_out(&config.dock_faults, motion_started_at, now)
         {
-            dock_left_mask = 0;
+            dock_front_mask = 0;
             dock_right_mask = 0;
         }
         let charger_enabled = _actuator_state
@@ -984,7 +979,7 @@ fn simulation_loop(
         if profile == MockProfile::RoborockS5Max
             && let Ok(mut signal) = dock_ir.lock()
         {
-            signal.set("left_mask", SensorValue::U16(dock_left_mask));
+            signal.set("front_mask", SensorValue::U16(dock_front_mask));
             signal.set("right_mask", SensorValue::U16(dock_right_mask));
             signal.touch();
         }
